@@ -47,7 +47,7 @@ jobs:
             -f content='eyes' >/dev/null 2>&1 || true
 
       - name: Checkout full history
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0   # need full history to cherry-pick
 
@@ -130,10 +130,26 @@ jobs:
                 gh pr comment "$PR_NUMBER" --body "Cherry-pick PR for \`$TARGET\` updated: $URL"
               fi
             else
-              git cherry-pick --abort 2>/dev/null || true
-              git reset --hard "origin/$TARGET"
-              gh pr comment "$PR_NUMBER" \
-                --body "Cherry-pick into \`$TARGET\` hit a conflict and needs a manual resolve. Nothing was pushed."
+              # Azure-style: never dead-end. Capture the conflicted state, push it, and open a
+              # DRAFT PR so conflicts are resolved in the GitHub UI instead of locally.
+              git add -A
+              git commit -qm "cherry-pick #${PR_NUMBER} into ${TARGET} (HAS CONFLICTS - resolve before merge)" || true
+              git cherry-pick --quit 2>/dev/null || true
+              git push -f origin "$NEW_BRANCH"
+              URL=$(gh pr list --head "$NEW_BRANCH" --base "$TARGET" --state open \
+                --json url -q '.[0].url' 2>/dev/null || true)
+              if [ -z "${URL:-}" ] || [ "$URL" = "null" ]; then
+                URL=$(gh pr create --draft \
+                  --base "$TARGET" \
+                  --head "$NEW_BRANCH" \
+                  --title "[cherry-pick CONFLICTS -> $TARGET] $PR_TITLE" \
+                  --body "Cherry-pick of #${PR_NUMBER} onto \`$TARGET\` had merge conflicts. This **draft** PR holds the partially-applied state (look for conflict markers in the diff). Resolve the conflicts, then mark it ready and merge." 2>/dev/null || true)
+              fi
+              if [ -n "${URL:-}" ] && [ "$URL" != "null" ]; then
+                gh pr comment "$PR_NUMBER" --body "Cherry-pick into \`$TARGET\` had conflicts. Opened a draft PR to resolve in the UI: $URL"
+              else
+                gh pr comment "$PR_NUMBER" --body "Cherry-pick into \`$TARGET\` had conflicts and a draft PR couldn't be opened automatically (drafts may be disabled). The branch \`$NEW_BRANCH\` was pushed for manual resolution."
+              fi
             fi
             echo "::endgroup::"
           done
