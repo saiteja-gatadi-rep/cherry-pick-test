@@ -104,37 +104,19 @@ jobs:
             NEW_BRANCH="cherry-pick/pr-${PR_NUMBER}-to-${SAFE_TARGET}"
             git checkout -B "$NEW_BRANCH" "origin/$TARGET"
 
-            # Apply ALL of the PR's commits as staged changes, then ONE commit = squashed.
-            if git cherry-pick -n "${PR_SHAS[@]}"; then
-              # If the change is already present on the target, there is nothing to commit.
-              if git diff --cached --quiet; then
-                gh pr comment "$PR_NUMBER" \
-                  --body "Nothing to cherry-pick into \`$TARGET\` — those changes are already there."
-                git reset --hard "origin/$TARGET"
-                echo "::endgroup::"; continue
-              fi
-              git commit -m "${PR_TITLE} (cherry-pick #${PR_NUMBER})"
-              git push -f origin "$NEW_BRANCH"
-              # Idempotent: if a cherry-pick PR for this branch already exists, reuse it
-              # (re-running the command must never fail with "a PR already exists").
-              URL=$(gh pr list --head "$NEW_BRANCH" --base "$TARGET" --state open \
-                --json url -q '.[0].url' 2>/dev/null || true)
-              if [ -z "${URL:-}" ] || [ "$URL" = "null" ]; then
-                URL=$(gh pr create \
-                  --base "$TARGET" \
-                  --head "$NEW_BRANCH" \
-                  --title "[cherry-pick -> $TARGET] $PR_TITLE" \
-                  --body "Squashed cherry-pick of #${PR_NUMBER} onto \`$TARGET\` (single commit). Review and merge when ready.")
-                gh pr comment "$PR_NUMBER" --body "Cherry-pick PR for \`$TARGET\` is ready: $URL"
-              else
-                gh pr comment "$PR_NUMBER" --body "Cherry-pick PR for \`$TARGET\` updated: $URL"
-              fi
-            else
-              # Azure-style: never dead-end. Capture the conflicted state, push it, and open a
-              # DRAFT PR so conflicts are resolved in the GitHub UI instead of locally.
+            # Apply ALL of the PR's commits as staged changes (squash into one).
+            # Do NOT trust the exit code: git cherry-pick exits non-zero for harmless
+            # reasons too (empty/redundant commits). The reliable conflict signal is
+            # whether there are unmerged files afterward.
+            git cherry-pick -n "${PR_SHAS[@]}" || true
+            git cherry-pick --quit 2>/dev/null || true
+
+            if git ls-files -u | grep -q .; then
+              # ---- REAL conflict: unmerged paths exist ----
+              # Azure-style: never dead-end. Capture the state and open a DRAFT PR so the
+              # conflict is resolved in the GitHub UI instead of locally.
               git add -A
               git commit -qm "cherry-pick #${PR_NUMBER} into ${TARGET} (HAS CONFLICTS - resolve before merge)" || true
-              git cherry-pick --quit 2>/dev/null || true
               git push -f origin "$NEW_BRANCH"
               URL=$(gh pr list --head "$NEW_BRANCH" --base "$TARGET" --state open \
                 --json url -q '.[0].url' 2>/dev/null || true)
@@ -149,6 +131,30 @@ jobs:
                 gh pr comment "$PR_NUMBER" --body "Cherry-pick into \`$TARGET\` had conflicts. Opened a draft PR to resolve in the UI: $URL"
               else
                 gh pr comment "$PR_NUMBER" --body "Cherry-pick into \`$TARGET\` had conflicts and a draft PR couldn't be opened automatically (drafts may be disabled). The branch \`$NEW_BRANCH\` was pushed for manual resolution."
+              fi
+
+            elif git diff --cached --quiet; then
+              # ---- nothing to apply: the change is already on the target ----
+              gh pr comment "$PR_NUMBER" \
+                --body "Nothing to cherry-pick into \`$TARGET\` — those changes are already there."
+              git reset --hard "origin/$TARGET"
+
+            else
+              # ---- clean cherry-pick: one squashed commit, open a normal PR ----
+              git commit -m "${PR_TITLE} (cherry-pick #${PR_NUMBER})"
+              git push -f origin "$NEW_BRANCH"
+              # Idempotent: reuse an existing cherry-pick PR instead of erroring on re-run.
+              URL=$(gh pr list --head "$NEW_BRANCH" --base "$TARGET" --state open \
+                --json url -q '.[0].url' 2>/dev/null || true)
+              if [ -z "${URL:-}" ] || [ "$URL" = "null" ]; then
+                URL=$(gh pr create \
+                  --base "$TARGET" \
+                  --head "$NEW_BRANCH" \
+                  --title "[cherry-pick -> $TARGET] $PR_TITLE" \
+                  --body "Squashed cherry-pick of #${PR_NUMBER} onto \`$TARGET\` (single commit). Review and merge when ready.")
+                gh pr comment "$PR_NUMBER" --body "Cherry-pick PR for \`$TARGET\` is ready: $URL"
+              else
+                gh pr comment "$PR_NUMBER" --body "Cherry-pick PR for \`$TARGET\` updated: $URL"
               fi
             fi
             echo "::endgroup::"
